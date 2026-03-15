@@ -2,8 +2,8 @@
 # Equivariant Temporal Sheaf Networks for Protein-Ligand Dissociation Kinetics
 
 model:
-  node_input_dim: 32
-  edge_input_dim: 28  # 16 RBF + 9 edge types + 3 unit vector
+  node_input_dim: 29   # max(21 atom, 21 residue) + 3 type flags + 1 charge + 1 SASA + 1 disp + 1 RMSF + 1 torsion
+  edge_input_dim: 28   # 16 RBF + 9 edge types + 3 unit vector
   hidden_dim: 128
   encoder_layers: 4
   encoder_dropout: 0.1

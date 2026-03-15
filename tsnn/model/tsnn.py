@@ -27,9 +27,9 @@ from tsnn.model.survival_head import SurvivalHead
 @dataclass
 class TSNNConfig:
     """Configuration for the TSNN model."""
-    # Encoder
-    node_input_dim: int = 32
-    edge_input_dim: int = 25
+    # Encoder — defaults match build_node_features (29) and build_edge_features (28)
+    node_input_dim: int = 29
+    edge_input_dim: int = 28
     hidden_dim: int = 128
     encoder_layers: int = 4
     encoder_dropout: float = 0.1
@@ -43,7 +43,7 @@ class TSNNConfig:
     identity_transport: bool = False
 
     # Hazard head
-    edge_feature_dim: int = 25
+    edge_feature_dim: int = 28
 
     # Survival head
     use_survival: bool = True

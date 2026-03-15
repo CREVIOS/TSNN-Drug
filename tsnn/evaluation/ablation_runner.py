@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from tsnn.model.tsnn import TSNNConfig
@@ -91,17 +92,22 @@ ABLATION_CONFIGS = {
 }
 
 
+@dataclass
+class AblationOverrides:
+    """Complete set of overrides for an ablation experiment."""
+    config: TSNNConfig
+    training_override: dict
+    loss_override: dict
+    data_override: dict
+
+
 def get_ablation_config(
     base_config: TSNNConfig, ablation_name: str
-) -> TSNNConfig:
-    """Create a model config with ablation overrides.
+) -> AblationOverrides:
+    """Create a full ablation override bundle.
 
-    Args:
-        base_config: Base TSNNConfig.
-        ablation_name: Name of the ablation.
-
-    Returns:
-        Modified TSNNConfig.
+    Returns an AblationOverrides with model config AND training/loss/data
+    overrides so callers can apply them all (fixes issue #12).
     """
     if ablation_name not in ABLATION_CONFIGS:
         raise ValueError(f"Unknown ablation: {ablation_name}")
@@ -115,7 +121,12 @@ def get_ablation_config(
         else:
             logger.warning(f"Config key {key} not found in TSNNConfig")
 
-    return config
+    return AblationOverrides(
+        config=config,
+        training_override=ablation.get("training_override", {}),
+        loss_override=ablation.get("loss_override", {}),
+        data_override=ablation.get("data_override", {}),
+    )
 
 
 def run_all_ablations(
@@ -128,7 +139,9 @@ def run_all_ablations(
 
     Args:
         base_config: Base model config.
-        train_fn: Function(config, ablation_name) -> model.
+        train_fn: Function(overrides: AblationOverrides, name: str) -> model.
+            Receives the full AblationOverrides bundle so it can apply
+            training_override, loss_override, and data_override.
         evaluate_fn: Function(model) -> metrics dict.
         output_dir: Output directory.
 
@@ -142,15 +155,21 @@ def run_all_ablations(
 
     # Run baseline first
     logger.info("Running baseline...")
-    baseline_model = train_fn(base_config, "baseline")
+    baseline_overrides = AblationOverrides(
+        config=base_config,
+        training_override={},
+        loss_override={},
+        data_override={},
+    )
+    baseline_model = train_fn(baseline_overrides, "baseline")
     results["baseline"] = evaluate_fn(baseline_model)
 
     # Run each ablation
     for abl_name in ABLATION_CONFIGS:
         logger.info(f"Running ablation: {abl_name}")
         try:
-            abl_config = get_ablation_config(base_config, abl_name)
-            model = train_fn(abl_config, abl_name)
+            overrides = get_ablation_config(base_config, abl_name)
+            model = train_fn(overrides, abl_name)
             metrics = evaluate_fn(model)
             results[abl_name] = metrics
             logger.info(f"  {abl_name}: {metrics}")

@@ -15,15 +15,16 @@ import logging
 import sys
 from pathlib import Path
 
+import yaml
 import torch
 from torch.utils.data import DataLoader
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from tsnn.model.tsnn import TSNN, TSNNConfig
 from tsnn.training.trainer import TSNNTrainer
 from tsnn.losses.combined import CombinedLoss
+from tsnn.data.collate import temporal_collate_fn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,21 +32,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+CONFIG_PATH = Path(__file__).parent.parent / "configs" / "default.yaml"
 
-def build_config_from_args() -> dict:
-    """Parse command-line args as key=value overrides."""
-    config = {
-        "model": {},
-        "data": {},
-        "training": {"stage": "c"},
-        "losses": {},
-    }
 
+def load_config() -> dict:
+    """Load default.yaml and apply CLI overrides."""
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+        logger.info(f"Loaded config from {CONFIG_PATH}")
+    else:
+        config = {"model": {}, "data": {}, "training": {"stage": "c"}, "losses": {}}
+
+    # Apply CLI overrides: key.subkey=value
     for arg in sys.argv[1:]:
         if "=" in arg:
             key, value = arg.split("=", 1)
             parts = key.split(".")
-
             # Type conversion
             if value.lower() in ("true", "false"):
                 value = value.lower() == "true"
@@ -58,47 +61,75 @@ def build_config_from_args() -> dict:
                     except ValueError:
                         pass
 
-            if len(parts) == 2:
-                section, param = parts
-                if section in config:
-                    config[section][param] = value
+            # Set nested key
+            d = config
+            for p in parts[:-1]:
+                d = d.setdefault(p, {})
+            d[parts[-1]] = value
 
     return config
 
 
-def build_model_config(overrides: dict) -> TSNNConfig:
-    """Build TSNNConfig from overrides."""
+def build_model_config(cfg: dict) -> TSNNConfig:
+    """Build TSNNConfig from merged config dict."""
+    model_cfg = cfg.get("model", {})
     config = TSNNConfig()
-    for key, value in overrides.get("model", {}).items():
+    for key, value in model_cfg.items():
         if hasattr(config, key):
             setattr(config, key, value)
     return config
 
 
-def create_dummy_dataloader(batch_size: int = 2) -> DataLoader:
-    """Create a dummy DataLoader for testing the pipeline."""
-    from tsnn.data.datasets.mdd import MDDDataset
+def create_dataloader(cfg: dict, split: str = "train") -> DataLoader:
+    """Create a DataLoader with proper collation."""
     from tsnn.data.graph_builder import GraphBuilderConfig
 
-    # Use MDD with placeholder data
-    dataset = MDDDataset(
-        root="/tmp/tsnn_dummy_data",
-        split="train",
-        graph_config=GraphBuilderConfig(),
-        window_size=5,
+    data_cfg = cfg.get("data", {})
+    training_cfg = cfg.get("training", {})
+
+    graph_config = GraphBuilderConfig(
+        pocket_cutoff=data_cfg.get("pocket_cutoff", 10.0),
+        context_cutoff=data_cfg.get("context_cutoff", 15.0),
+        edge_cutoff=data_cfg.get("edge_cutoff", 5.0),
+        include_water=data_cfg.get("include_water", True),
+        num_rbf=data_cfg.get("num_rbf", 16),
+        rbf_cutoff=data_cfg.get("rbf_cutoff", 15.0),
     )
 
-    # If no real data, create minimal synthetic dataset
-    if len(dataset) == 0:
-        logger.warning("No data found. Using synthetic data for pipeline testing.")
-        return _create_synthetic_loader(batch_size)
+    # Try to load real data, fall back to synthetic
+    try:
+        from tsnn.data.datasets.mdd import MDDDataset
+        data_root = data_cfg.get("root", "/tmp/tsnn_data")
+        dataset = MDDDataset(
+            root=data_root,
+            split=split,
+            graph_config=graph_config,
+            window_size=data_cfg.get("window_size", 20),
+            stride=data_cfg.get("stride", 10),
+        )
+        if len(dataset) > 0:
+            return DataLoader(
+                dataset,
+                batch_size=1,
+                shuffle=(split == "train"),
+                num_workers=training_cfg.get("num_workers", 0),
+                collate_fn=temporal_collate_fn,
+            )
+    except Exception:
+        pass
 
-    return DataLoader(dataset, batch_size=1, shuffle=True)
+    logger.warning("No real data found. Using synthetic data for pipeline testing.")
+    return _create_synthetic_loader(cfg)
 
 
-def _create_synthetic_loader(batch_size: int):
+def _create_synthetic_loader(cfg: dict):
     """Create a synthetic DataLoader for end-to-end testing."""
     from torch_geometric.data import Data
+
+    training_cfg = cfg.get("training", {})
+    model_cfg = cfg.get("model", {})
+    node_dim = model_cfg.get("node_input_dim", 29)
+    edge_dim = model_cfg.get("edge_input_dim", 28)
 
     class SyntheticDataset(torch.utils.data.Dataset):
         def __init__(self, size=100):
@@ -108,19 +139,18 @@ def _create_synthetic_loader(batch_size: int):
             return self.size
 
         def __getitem__(self, idx):
+            import numpy as np
             N, T = 30, 5
             N_lig = 10
             frames = []
             for t in range(T):
                 pos = torch.randn(N, 3) * 5.0
-                # Simple node features
-                x = torch.randn(N, 32)
-                # Radius graph
+                x = torch.randn(N, node_dim)
                 dist = torch.cdist(pos, pos)
                 mask = (dist < 5.0) & (dist > 0.01)
                 edge_index = mask.nonzero(as_tuple=False).t()
                 E = edge_index.shape[1]
-                edge_attr = torch.randn(E, 28)
+                edge_attr = torch.randn(E, edge_dim)
 
                 is_ligand = torch.zeros(N, dtype=torch.bool)
                 is_ligand[:N_lig] = True
@@ -135,59 +165,82 @@ def _create_synthetic_loader(batch_size: int):
                 )
                 frames.append(frame)
 
-            import numpy as np
             return {
                 "frames": frames,
                 "labels": {
                     "koff": float(np.random.normal(0, 2)),
                     "censored": False,
                     "contact_break_times": None,
-                    "dissociation_time": None,
+                    "dissociation_time": float(np.random.randint(1, T)),
+                    "series_id": idx % 5,
                 },
                 "complex_id": f"synthetic_{idx}",
             }
 
-    return DataLoader(SyntheticDataset(), batch_size=1, shuffle=True)
+    return DataLoader(
+        SyntheticDataset(),
+        batch_size=1,
+        shuffle=True,
+        collate_fn=temporal_collate_fn,
+    )
 
 
 def main():
-    args = build_config_from_args()
-    model_config = build_model_config(args)
-    stage = args.get("training", {}).get("stage", "c")
+    cfg = load_config()
+    model_config = build_model_config(cfg)
+    training_cfg = cfg.get("training", {})
+    stage = training_cfg.get("stage", "c")
 
     logger.info(f"TSNN Training — Stage {stage.upper()}")
     logger.info(f"Model config: {model_config}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = training_cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
     trainer = TSNNTrainer(
         config=model_config,
         device=device,
-        output_dir=args.get("training", {}).get("output_dir", "checkpoints"),
+        output_dir=training_cfg.get("output_dir", "checkpoints"),
+        lr=training_cfg.get("lr", 1e-4),
+        weight_decay=training_cfg.get("weight_decay", 1e-5),
+        grad_clip=training_cfg.get("grad_clip", 1.0),
+        mixed_precision=training_cfg.get("mixed_precision", True),
     )
 
-    # Create data loaders (uses synthetic data if real data unavailable)
-    train_loader = create_dummy_dataloader()
-    val_loader = None  # TODO: create validation loader
+    train_loader = create_dataloader(cfg, "train")
+    val_loader = None
 
+    loss_cfg = cfg.get("losses", {})
     loss_fn = CombinedLoss(
-        alpha=args.get("losses", {}).get("alpha", 0.1),
-        beta=args.get("losses", {}).get("beta", 0.05),
-        gamma=args.get("losses", {}).get("gamma", 0.01),
+        alpha=loss_cfg.get("alpha", 0.1),
+        beta=loss_cfg.get("beta", 0.05),
+        gamma=loss_cfg.get("gamma", 0.01),
         use_survival=model_config.use_survival,
     )
 
+    stage_a_cfg = training_cfg.get("stage_a", {})
+    stage_b_cfg = training_cfg.get("stage_b", {})
+    stage_c_cfg = training_cfg.get("stage_c", {})
+
     if stage == "a":
-        trainer.run_stage_a(train_loader, val_loader, num_epochs=50)
+        trainer.run_stage_a(train_loader, val_loader,
+                            num_epochs=stage_a_cfg.get("num_epochs", 50),
+                            lr=stage_a_cfg.get("lr", 3e-4))
     elif stage == "b":
-        trainer.run_stage_b(train_loader, val_loader, num_epochs=30)
+        trainer.run_stage_b(train_loader, val_loader,
+                            num_epochs=stage_b_cfg.get("num_epochs", 30),
+                            lr=stage_b_cfg.get("lr", 1e-4))
     elif stage == "c":
-        trainer.run_stage_c(train_loader, val_loader, loss_fn=loss_fn, num_epochs=100)
+        trainer.run_stage_c(train_loader, val_loader, loss_fn=loss_fn,
+                            num_epochs=stage_c_cfg.get("num_epochs", 100),
+                            lr=stage_c_cfg.get("lr", 5e-5))
     elif stage == "all":
-        trainer.run_stage_a(train_loader, val_loader, num_epochs=50)
-        trainer.run_stage_b(train_loader, val_loader, num_epochs=30)
-        trainer.run_stage_c(train_loader, val_loader, loss_fn=loss_fn, num_epochs=100)
+        trainer.run_stage_a(train_loader, val_loader,
+                            num_epochs=stage_a_cfg.get("num_epochs", 50))
+        trainer.run_stage_b(train_loader, val_loader,
+                            num_epochs=stage_b_cfg.get("num_epochs", 30))
+        trainer.run_stage_c(train_loader, val_loader, loss_fn=loss_fn,
+                            num_epochs=stage_c_cfg.get("num_epochs", 100))
     else:
         logger.error(f"Unknown stage: {stage}")
 

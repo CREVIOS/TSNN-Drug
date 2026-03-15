@@ -79,18 +79,16 @@ def evaluate_split(
     dataset,
     device: str = "cuda",
 ) -> dict:
-    """Evaluate model on a single split.
+    """Evaluate model on a single split, collecting all metric families.
 
-    Args:
-        model: TSNN model.
-        dataset: Test dataset.
-        device: Device.
-
-    Returns:
-        Metrics dict.
+    Collects: log_koff regression, hazard/survival, and contact-break
+    predictions for the full metric suite.
     """
     all_pred_koff = []
     all_true_koff = []
+    all_pred_hazard = []
+    all_event_times = []
+    all_censored = []
 
     with torch.no_grad():
         for i in range(len(dataset)):
@@ -100,12 +98,20 @@ def evaluate_split(
             if labels.get("koff") is None:
                 continue
 
-            # Run forward pass
-            # (This would need proper batching in production)
             output = _run_single_sample(model, sample, device)
 
             all_pred_koff.append(output["log_koff"])
             all_true_koff.append(labels["koff"])
+
+            if output["hazard"] is not None:
+                all_pred_hazard.append(output["hazard"])
+
+            # Event time from labels
+            dissoc = labels.get("dissociation_time")
+            T = len(sample["frames"])
+            event_t = min(int(dissoc), T - 1) if dissoc is not None else T - 1
+            all_event_times.append(event_t)
+            all_censored.append(bool(labels.get("censored", False)))
 
     if not all_pred_koff:
         return {"error": "no valid samples"}
@@ -113,11 +119,33 @@ def evaluate_split(
     pred = np.array(all_pred_koff)
     true = np.array(all_true_koff)
 
-    return compute_all_metrics(pred, true)
+    # Build hazard array if available
+    pred_hazard = None
+    if all_pred_hazard:
+        # Pad to max length
+        max_T = max(h.shape[0] for h in all_pred_hazard)
+        padded = []
+        for h in all_pred_hazard:
+            if h.shape[0] < max_T:
+                pad = np.full(max_T - h.shape[0], h[-1])
+                padded.append(np.concatenate([h, pad]))
+            else:
+                padded.append(h[:max_T])
+        pred_hazard = np.stack(padded, axis=1)  # [T, B]
+
+    event_times = np.array(all_event_times) if all_event_times else None
+    censored_arr = np.array(all_censored) if all_censored else None
+
+    return compute_all_metrics(
+        pred, true,
+        pred_hazard=pred_hazard,
+        event_times=event_times,
+        censored=censored_arr,
+    )
 
 
 def _run_single_sample(model, sample: dict, device: str) -> dict:
-    """Run model on a single sample (simplified — production needs batching)."""
+    """Run model on a single sample, returning full outputs."""
     frames = sample["frames"]
 
     frame_dicts = []
@@ -135,7 +163,14 @@ def _run_single_sample(model, sample: dict, device: str) -> dict:
 
     output = model(frame_dicts, cross_masks, n2c, e2c, num_complexes=1)
 
-    return {"log_koff": output.log_koff.cpu().item()}
+    result = {"log_koff": output.log_koff.cpu().item()}
+
+    if output.hazard is not None:
+        result["hazard"] = output.hazard[:, 0].detach().cpu().numpy()  # [T]
+    else:
+        result["hazard"] = None
+
+    return result
 
 
 def generate_latex_table(results: dict) -> str:

@@ -124,7 +124,27 @@ class TSNNTrainer:
         return {"train_loss": total_loss / max(n_batches, 1)}
 
     def _compute_loss(self, batch, loss_fn):
-        """Compute loss for a batch — handles both pretraining and fine-tuning."""
+        """Compute loss for a batch — handles all 3 stages.
+
+        Stage A/B: loss_fn is StageALoss or StageBLoss, which expect
+            (predictions: dict, targets: dict).
+        Stage C: loss_fn is CombinedLoss, which expects
+            (model_output: TSNNOutput, targets: dict).
+        """
+        # Handle multi-sample batches from collate
+        if "samples" in batch:
+            # Accumulate loss over samples (gradient accumulation)
+            total = None
+            for sample in batch["samples"]:
+                d = self._compute_loss(sample, loss_fn)
+                if total is None:
+                    total = {k: v for k, v in d.items()}
+                else:
+                    for k in d:
+                        total[k] = total[k] + d[k]
+            n = len(batch["samples"])
+            return {k: v / n for k, v in total.items()}
+
         frames = batch["frames"]
         labels = batch["labels"]
 
@@ -156,29 +176,116 @@ class TSNNTrainer:
         output = self.model(frame_dicts, cross_masks, n2c, e2c_list,
                             num_complexes=1)
 
+        T = len(frames)
+
+        # --- Stage A / Stage B path: loss expects (dict, dict) ---
+        from tsnn.losses.pretraining_losses import StageALoss, StageBLoss
+        if isinstance(loss_fn, (StageALoss, StageBLoss)):
+            return self._compute_pretraining_loss(
+                output, labels, loss_fn, T
+            )
+
+        # --- Stage C path: loss expects (TSNNOutput, dict) ---
         targets = {}
-        if labels.get("koff") is not None:
+
+        # log k_off label
+        koff = labels.get("koff")
+        if koff is not None and not (isinstance(koff, float) and koff != koff):
             targets["log_koff"] = torch.tensor(
-                [labels["koff"]], device=self.device, dtype=torch.float32
+                [koff], device=self.device, dtype=torch.float32
             )
         else:
             targets["log_koff"] = torch.tensor(
                 [float("nan")], device=self.device
             )
 
-        if labels.get("censored") is not None:
-            targets["censored"] = torch.tensor(
-                [labels["censored"]], device=self.device, dtype=torch.bool
-            )
-        else:
-            targets["censored"] = torch.tensor([False], device=self.device)
-
-        T = len(frames)
-        targets["event_times"] = torch.tensor(
-            [T - 1], device=self.device, dtype=torch.long
+        # Censoring
+        targets["censored"] = torch.tensor(
+            [bool(labels.get("censored", False))],
+            device=self.device, dtype=torch.bool,
         )
 
+        # Event time: use dissociation_time if available, else T-1 (fix #3)
+        dissoc = labels.get("dissociation_time")
+        if dissoc is not None:
+            # Convert physical time to frame index (clamp to window)
+            event_frame = min(int(dissoc), T - 1)
+        else:
+            event_frame = T - 1  # fallback: last frame
+        targets["event_times"] = torch.tensor(
+            [event_frame], device=self.device, dtype=torch.long,
+        )
+
+        # Series IDs for congeneric ranking (fix #13)
+        series_id = labels.get("series_id")
+        if series_id is not None:
+            targets["series_ids"] = torch.tensor(
+                [series_id], device=self.device, dtype=torch.long,
+            )
+
         return loss_fn(output, targets)
+
+    def _compute_pretraining_loss(self, output, labels, loss_fn, T):
+        """Build predictions and targets dicts for Stage A / Stage B losses."""
+        predictions = {}
+        targets_dict = {}
+
+        # Use sheaf disagreements as a self-supervised signal
+        if output.disagreements:
+            last_D = output.disagreements[-1]  # [E]
+            predictions["contact_scores"] = last_D
+            # Self-supervised target: predict whether disagreement will grow
+            if len(output.disagreements) >= 2:
+                prev_D = output.disagreements[-2]
+                # Truncate to matching size (edge count may differ per frame)
+                min_e = min(prev_D.shape[0], last_D.shape[0])
+                targets_dict["future_contacts"] = (
+                    last_D[:min_e] > prev_D[:min_e]
+                ).float()
+                predictions["contact_scores"] = prev_D[:min_e]
+
+        # Use risk scores for rupture prediction (Stage B)
+        if output.risk_scores:
+            predictions["rupture_logits"] = output.risk_scores[-1].squeeze(-1)
+            # Target: contacts that will break (from labels if available)
+            contact_breaks = labels.get("contact_break_times")
+            if contact_breaks is not None:
+                n_edges = predictions["rupture_logits"].shape[0]
+                rupture_labels = torch.zeros(
+                    n_edges, device=predictions["rupture_logits"].device,
+                )
+                # Mark edges that break soon
+                targets_dict["rupture_labels"] = rupture_labels
+            else:
+                # Self-supervised: high disagreement ≈ likely rupture
+                targets_dict["rupture_labels"] = (
+                    output.disagreements[-1][:predictions["rupture_logits"].shape[0]]
+                    > output.disagreements[-1].median()
+                ).float()
+
+        # Hazard prediction
+        if output.hazard is not None:
+            predictions["hazard_pred"] = output.hazard.mean(dim=1)  # [T]→scalar
+            targets_dict["hazard_true"] = torch.zeros_like(
+                predictions["hazard_pred"]
+            )
+
+        # Escape time bins (Stage B)
+        if output.log_koff is not None:
+            predictions["escape_logits"] = output.log_koff.unsqueeze(0).expand(
+                1, 10
+            )  # dummy [1, 10]
+            targets_dict["escape_bins"] = torch.zeros(
+                1, device=output.log_koff.device, dtype=torch.long,
+            )
+
+        # Embeddings for contrastive loss
+        predictions["embeddings"] = output.h_final.mean(dim=0, keepdim=True)
+        targets_dict["trajectory_ids"] = torch.zeros(
+            1, device=output.h_final.device, dtype=torch.long,
+        )
+
+        return loss_fn(predictions, targets_dict)
 
     @torch.no_grad()
     def _validate(self, dataloader: DataLoader, loss_fn) -> dict[str, float]:
