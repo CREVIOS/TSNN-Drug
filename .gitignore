@@ -1,0 +1,53 @@
+# Virtual environments
+tsnn_env/
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Pytest
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data (large files)
+data/
+*.h5
+*.hdf5
+*.xtc
+*.dcd
+*.trr
+*.npz
+*.npy
+
+# Checkpoints and results
+checkpoints/
+results/
+ablation_results/
+wandb/
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/
