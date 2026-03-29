@@ -81,8 +81,10 @@ class EquivariantEncoder(nn.Module):
         Returns:
             Node embeddings h [N, hidden_dim] — invariant under E(3).
         """
+        # Clamp inputs for numerical stability under mixed precision
+        node_features = node_features.clamp(-100, 100)
         h = self.node_embed(node_features)
-        x = positions.clone()
+        x = positions.clamp(-500, 500).clone()
 
         if self.edge_embed is not None and edge_attr is not None:
             ea = self.edge_embed(edge_attr)

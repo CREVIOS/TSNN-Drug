@@ -76,7 +76,6 @@ def main():
             split=split,
             graph_config=graph_config,
             window_size=data_cfg.get("window_size", 20),
-            random_window=False,
         )
         if len(dataset) == 0:
             raise FileNotFoundError(

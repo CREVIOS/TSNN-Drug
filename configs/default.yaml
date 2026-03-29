@@ -4,7 +4,7 @@
 model:
   node_input_dim: 29   # max(21 atom, 21 residue) + 3 type flags + 1 charge + 1 SASA + 1 disp + 1 RMSF + 1 torsion
   edge_input_dim: 28   # 16 RBF + 9 edge types + 3 unit vector
-  hidden_dim: 128
+  hidden_dim: 64
   encoder_layers: 4
   encoder_dropout: 0.1
   update_coords: true
@@ -16,6 +16,17 @@ model:
   use_survival: true
   no_equivariant: false
 
+  # Innovation 1: Continuous-time sheaf Neural ODE
+  use_ode: true
+  ode_solver: "euler"
+  ode_rtol: 0.001
+  ode_atol: 0.001
+
+  # Innovation 2: Multi-scale sheaf spectral decomposition
+  use_multiscale: true
+  chebyshev_order: 2
+  num_bands: 2
+
 data:
   pocket_cutoff: 10.0
   context_cutoff: 15.0
@@ -23,30 +34,30 @@ data:
   include_water: true
   num_rbf: 16
   rbf_cutoff: 15.0
-  window_size: 20
-  stride: 10
+  window_size: 10
+  stride: 5
   frame_subsample: 1
 
 training:
-  stage: "c"  # "a", "b", or "c"
+  stage: "b"  # Stage B — real DD-13M data available
   device: "cuda"
-  lr: 1e-4
-  weight_decay: 1e-5
+  lr: 0.0001
+  weight_decay: 0.00001
   grad_clip: 1.0
   mixed_precision: true
-  batch_size: 4
-  num_workers: 4
+  batch_size: 1
+  num_workers: 2
   output_dir: "checkpoints"
 
   stage_a:
     num_epochs: 50
-    lr: 3e-4
+    lr: 0.0003
   stage_b:
-    num_epochs: 30
-    lr: 1e-4
+    num_epochs: 5
+    lr: 0.0001
   stage_c:
-    num_epochs: 100
-    lr: 5e-5
+    num_epochs: 5
+    lr: 0.00005
 
 losses:
   alpha: 0.1   # regression weight

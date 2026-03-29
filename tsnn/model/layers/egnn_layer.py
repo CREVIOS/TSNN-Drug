@@ -84,7 +84,7 @@ class EGNNLayer(nn.Module):
         """
         row, col = edge_index  # row=source, col=target
         diff = x[row] - x[col]  # [E, 3]
-        dist_sq = (diff * diff).sum(dim=-1, keepdim=True)  # [E, 1]
+        dist_sq = (diff * diff).sum(dim=-1, keepdim=True).clamp(max=1e4)  # [E, 1]
 
         # Build message input
         msg_input = [h[row], h[col], dist_sq]

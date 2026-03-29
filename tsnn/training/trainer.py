@@ -72,11 +72,13 @@ class TSNNTrainer:
     def _build_scheduler(
         self, optimizer, num_epochs: int, warmup_epochs: int = 5
     ):
+        warmup_epochs = min(warmup_epochs, max(num_epochs - 1, 1))
+        cosine_epochs = max(num_epochs - warmup_epochs, 1)
         warmup = LinearLR(
             optimizer, start_factor=0.1, total_iters=warmup_epochs
         )
         cosine = CosineAnnealingLR(
-            optimizer, T_max=num_epochs - warmup_epochs
+            optimizer, T_max=cosine_epochs
         )
         return SequentialLR(optimizer, [warmup, cosine],
                             milestones=[warmup_epochs])
@@ -233,10 +235,11 @@ class TSNNTrainer:
         # Use sheaf disagreements as a self-supervised signal
         if output.disagreements:
             last_D = output.disagreements[-1]  # [E]
+            last_D = torch.nan_to_num(last_D, nan=0.0)
             predictions["contact_scores"] = last_D
             # Self-supervised target: predict whether disagreement will grow
             if len(output.disagreements) >= 2:
-                prev_D = output.disagreements[-2]
+                prev_D = torch.nan_to_num(output.disagreements[-2], nan=0.0)
                 # Truncate to matching size (edge count may differ per frame)
                 min_e = min(prev_D.shape[0], last_D.shape[0])
                 targets_dict["future_contacts"] = (
@@ -246,37 +249,41 @@ class TSNNTrainer:
 
         # Use risk scores for rupture prediction (Stage B)
         if output.risk_scores:
-            predictions["rupture_logits"] = output.risk_scores[-1].squeeze(-1)
+            rupture_logits = output.risk_scores[-1].squeeze(-1)
+            rupture_logits = torch.nan_to_num(rupture_logits, nan=0.0).clamp(-10, 10)
+            predictions["rupture_logits"] = rupture_logits
             # Target: contacts that will break (from labels if available)
             contact_breaks = labels.get("contact_break_times")
             if contact_breaks is not None:
-                n_edges = predictions["rupture_logits"].shape[0]
+                n_edges = rupture_logits.shape[0]
                 rupture_labels = torch.zeros(
-                    n_edges, device=predictions["rupture_logits"].device,
+                    n_edges, device=rupture_logits.device,
                 )
-                # Mark edges that break soon
                 targets_dict["rupture_labels"] = rupture_labels
             else:
                 # Self-supervised: high disagreement ≈ likely rupture
+                clean_D = torch.nan_to_num(output.disagreements[-1], nan=0.0)
                 targets_dict["rupture_labels"] = (
-                    output.disagreements[-1][:predictions["rupture_logits"].shape[0]]
-                    > output.disagreements[-1].median()
+                    clean_D[:rupture_logits.shape[0]]
+                    > clean_D.median()
                 ).float()
 
         # Hazard prediction
         if output.hazard is not None:
-            predictions["hazard_pred"] = output.hazard.mean(dim=1)  # [T]→scalar
+            hazard_clean = torch.nan_to_num(output.hazard, nan=0.0)
+            predictions["hazard_pred"] = hazard_clean.mean(dim=1)
             targets_dict["hazard_true"] = torch.zeros_like(
                 predictions["hazard_pred"]
             )
 
         # Escape time bins (Stage B)
         if output.log_koff is not None:
-            predictions["escape_logits"] = output.log_koff.unsqueeze(0).expand(
+            koff_clean = torch.nan_to_num(output.log_koff, nan=0.0)
+            predictions["escape_logits"] = koff_clean.unsqueeze(0).expand(
                 1, 10
             )  # dummy [1, 10]
             targets_dict["escape_bins"] = torch.zeros(
-                1, device=output.log_koff.device, dtype=torch.long,
+                1, device=koff_clean.device, dtype=torch.long,
             )
 
         # Embeddings for contrastive loss

@@ -67,7 +67,24 @@ def load_config() -> dict:
                 d = d.setdefault(p, {})
             d[parts[-1]] = value
 
+    # Ensure numeric strings (like scientific notation) are converted
+    _coerce_numerics(config)
     return config
+
+
+def _coerce_numerics(d: dict):
+    """Recursively convert string values that look numeric to float/int."""
+    for k, v in d.items():
+        if isinstance(v, dict):
+            _coerce_numerics(v)
+        elif isinstance(v, str):
+            try:
+                d[k] = int(v)
+            except ValueError:
+                try:
+                    d[k] = float(v)
+                except ValueError:
+                    pass
 
 
 def build_model_config(cfg: dict) -> TSNNConfig:
@@ -96,22 +113,100 @@ def create_dataloader(cfg: dict, split: str = "train") -> DataLoader:
         rbf_cutoff=data_cfg.get("rbf_cutoff", 15.0),
     )
 
-    # Try to load real data, fall back to synthetic
+    stage = training_cfg.get("stage", "c")
+    project_root = Path(__file__).parent.parent
+    processed_dir = project_root / "data" / "processed"
+
+    # --- Stage C: try kinetics dataset with real koff labels ---
+    if stage == "c":
+        labels_csv = processed_dir / "stage_c" / "kinetics_labels.csv"
+        split_file = processed_dir / "stage_c" / "splits" / f"{split}.txt"
+        traj_dir = processed_dir / "stage_a"  # Reuse Stage A trajectories
+
+        if labels_csv.exists():
+            try:
+                from tsnn.data.datasets.kinetics import KineticsDataset
+                dataset = KineticsDataset(
+                    labels_csv=str(labels_csv),
+                    trajectory_dir=str(traj_dir) if traj_dir.exists() else None,
+                    split_file=str(split_file) if split_file.exists() else None,
+                    window_size=data_cfg.get("window_size", 20),
+                    edge_cutoff=data_cfg.get("edge_cutoff", 5.0),
+                )
+                if len(dataset) > 0:
+                    logger.info(f"Loaded kinetics dataset: {len(dataset)} samples ({split})")
+                    return DataLoader(
+                        dataset, batch_size=1, shuffle=(split == "train"),
+                        num_workers=training_cfg.get("num_workers", 0),
+                        collate_fn=temporal_collate_fn,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load kinetics dataset: {e}")
+
+    # --- Stage B: try DD-13M dissociation trajectories ---
+    if stage == "b":
+        dd13m_dir = processed_dir / "stage_b"
+        if dd13m_dir.exists() and list(dd13m_dir.glob("*.h5")):
+            try:
+                from tsnn.data.datasets.dd13m import DD13MDataset
+                dataset = DD13MDataset(
+                    root=str(dd13m_dir),
+                    window_size=data_cfg.get("window_size", 20),
+                    stride=data_cfg.get("stride", 10),
+                    edge_cutoff=data_cfg.get("edge_cutoff", 5.0),
+                )
+                if len(dataset) > 0:
+                    logger.info(f"Loaded DD-13M dataset: {len(dataset)} samples")
+                    return DataLoader(
+                        dataset, batch_size=1, shuffle=(split == "train"),
+                        num_workers=training_cfg.get("num_workers", 0),
+                        collate_fn=temporal_collate_fn,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load DD-13M dataset: {e}")
+
+    # --- Stage A: try MISATO or MDD ---
+    if stage in ("a", "all"):
+        for source in ["misato", "mdd"]:
+            source_dir = processed_dir / "stage_a" / source
+            if not source_dir.exists():
+                continue
+            split_dir = source_dir / split if (source_dir / split).exists() else source_dir
+            h5_files = list(split_dir.glob("*.h5"))
+            if not h5_files:
+                continue
+
+            try:
+                from tsnn.data.datasets.misato import MISATODataset
+                dataset = MISATODataset(
+                    root=str(source_dir),
+                    split=split,
+                    window_size=data_cfg.get("window_size", 20),
+                    stride=data_cfg.get("stride", 10),
+                    edge_cutoff=data_cfg.get("edge_cutoff", 5.0),
+                )
+                if len(dataset) > 0:
+                    logger.info(f"Loaded {source.upper()} dataset: {len(dataset)} samples ({split})")
+                    return DataLoader(
+                        dataset, batch_size=1, shuffle=(split == "train"),
+                        num_workers=training_cfg.get("num_workers", 0),
+                        collate_fn=temporal_collate_fn,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load {source} dataset: {e}")
+
+    # --- Fallback: try legacy MDD loader ---
     try:
         from tsnn.data.datasets.mdd import MDDDataset
         data_root = data_cfg.get("root", "/tmp/tsnn_data")
         dataset = MDDDataset(
-            root=data_root,
-            split=split,
-            graph_config=graph_config,
+            root=data_root, split=split, graph_config=graph_config,
             window_size=data_cfg.get("window_size", 20),
             stride=data_cfg.get("stride", 10),
         )
         if len(dataset) > 0:
             return DataLoader(
-                dataset,
-                batch_size=1,
-                shuffle=(split == "train"),
+                dataset, batch_size=1, shuffle=(split == "train"),
                 num_workers=training_cfg.get("num_workers", 0),
                 collate_fn=temporal_collate_fn,
             )

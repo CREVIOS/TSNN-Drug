@@ -160,9 +160,9 @@ class TemporalSheafTransport(nn.Module):
         # Q_uv @ h_v
         Qh_v = torch.bmm(Q, h_v.unsqueeze(-1)).squeeze(-1)  # [E, D]
 
-        # ||h_u - Q_uv h_v||^2
+        # ||h_u - Q_uv h_v||^2 (clamped for numerical stability in fp16)
         diff = h_u - Qh_v
-        disagreement = (diff * diff).sum(dim=-1)  # [E]
+        disagreement = (diff * diff).sum(dim=-1).clamp(max=1e4)  # [E]
         return disagreement
 
     def forward(

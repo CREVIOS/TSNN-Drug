@@ -27,7 +27,7 @@ def householder_reflection(v: Tensor) -> Tensor:
         Reflection matrices [*, d, d].
     """
     # Normalize to avoid numerical issues
-    v_norm_sq = (v * v).sum(dim=-1, keepdim=True).clamp(min=1e-8)  # [*, 1]
+    v_norm_sq = (v.float() * v.float()).sum(dim=-1, keepdim=True).clamp(min=1e-6)  # [*, 1]
     v = v.unsqueeze(-1)  # [*, d, 1]
     v_t = v.transpose(-2, -1)  # [*, 1, d]
     d = v.shape[-2]

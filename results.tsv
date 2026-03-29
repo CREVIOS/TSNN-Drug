@@ -1,0 +1,4 @@
+commit	train_loss	vram_mb	status	description
+baseline	4.3749	19493	keep	baseline default config
+v1_ode_ms_baseline	1.649349204972441	22017	1824s	keep	ODE+Multiscale baseline: D64, euler, cheby2, 2bands, Stage B real DD-13M
+v2_ode_only	1.7737818529942477	22017	1605s	keep	ODE only (no multiscale): D64, euler, Stage B

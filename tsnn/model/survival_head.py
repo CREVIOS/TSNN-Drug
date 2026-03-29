@@ -98,7 +98,8 @@ class SurvivalHead(nn.Module):
             output["hazard"] = hazard
 
             # Survival: S(t) = prod_{tau<=t} (1 - lambda(tau))  (Eq. 14)
-            survival = torch.cumprod(1.0 - hazard, dim=0)  # [T, B]
+            # Clamp hazard to (0, 1) to prevent cumprod collapse
+            survival = torch.cumprod((1.0 - hazard).clamp(min=1e-7, max=1.0), dim=0)  # [T, B]
             output["survival"] = survival
         else:
             output["hazard"] = None

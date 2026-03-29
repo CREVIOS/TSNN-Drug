@@ -53,6 +53,17 @@ class TSNNConfig:
     no_equivariant: bool = False
     rbf_dim: int = 16
 
+    # Innovation 1: Continuous-time sheaf Neural ODE
+    use_ode: bool = False
+    ode_solver: str = "rk4"
+    ode_rtol: float = 1e-3
+    ode_atol: float = 1e-3
+
+    # Innovation 2: Multi-scale sheaf spectral decomposition
+    use_multiscale: bool = False
+    chebyshev_order: int = 4
+    num_bands: int = 3
+
 
 @dataclass
 class TSNNOutput:
@@ -99,15 +110,39 @@ class TSNN(nn.Module):
             )
 
         # Component 3: temporal sheaf transport
-        self.sheaf_transport = TemporalSheafTransport(
-            hidden_dim=D,
-            edge_dim=config.edge_input_dim,
-            householder_depth=config.householder_depth,
-            num_sheaf_layers=config.num_sheaf_layers,
-            dropout=config.sheaf_dropout,
-            static_frames=config.static_frames,
-            identity_transport=config.identity_transport,
-        )
+        if config.use_ode:
+            from tsnn.model.sheaf_ode import ContinuousSheafTransport
+            self.sheaf_transport = ContinuousSheafTransport(
+                hidden_dim=D,
+                edge_dim=config.edge_input_dim,
+                householder_depth=config.householder_depth,
+                dropout=config.sheaf_dropout,
+                static_frames=config.static_frames,
+                identity_transport=config.identity_transport,
+                ode_solver=config.ode_solver,
+                ode_rtol=config.ode_rtol,
+                ode_atol=config.ode_atol,
+            )
+        else:
+            self.sheaf_transport = TemporalSheafTransport(
+                hidden_dim=D,
+                edge_dim=config.edge_input_dim,
+                householder_depth=config.householder_depth,
+                num_sheaf_layers=config.num_sheaf_layers,
+                dropout=config.sheaf_dropout,
+                static_frames=config.static_frames,
+                identity_transport=config.identity_transport,
+            )
+
+        # Innovation 2: multi-scale spectral decomposition (optional)
+        self.multiscale = None
+        if config.use_multiscale:
+            from tsnn.model.spectral_sheaf import MultiScaleSheafDecomposition
+            self.multiscale = MultiScaleSheafDecomposition(
+                hidden_dim=D,
+                num_bands=config.num_bands,
+                chebyshev_order=config.chebyshev_order,
+            )
 
         # Component 4a: contact hazard head
         self.hazard_head = ContactHazardHead(
@@ -201,6 +236,18 @@ class TSNN(nn.Module):
         sheaf_out: SheafTransportOutput = self.sheaf_transport(
             h_encoded, edge_indices, edge_attrs
         )
+
+        # Step 2b: Multi-scale spectral enhancement (Innovation 2)
+        if self.multiscale is not None:
+            enhanced_h = []
+            for t in range(T):
+                Q_t = sheaf_out.transport_maps[t]
+                ei_t = edge_indices[t]
+                h_t = sheaf_out.h_sequence[t]
+                h_ms = self.multiscale(h_t, Q_t, ei_t)
+                enhanced_h.append(h_ms)
+            sheaf_out.h_sequence = enhanced_h
+            sheaf_out.h_final = enhanced_h[-1]
 
         # Step 3: Contact hazard for cross-contact edges (Component 4a)
         risk_scores_seq = []
