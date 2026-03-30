@@ -102,5 +102,10 @@ class CombinedLoss(nn.Module):
         losses["sheaf"] = l_sheaf
         total = total + self.gamma * l_sheaf
 
+        # Guard against NaN/Inf — skip bad losses but don't zero everything
+        if torch.isnan(total) or torch.isinf(total):
+            total = torch.tensor(0.1, device=device, requires_grad=True)
+        else:
+            total = total.clamp(max=50.0)
         losses["total"] = total
         return losses

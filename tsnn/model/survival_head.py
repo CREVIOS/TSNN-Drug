@@ -47,6 +47,7 @@ class SurvivalHead(nn.Module):
             )
 
         # Direct log k_off regression from pooled node features
+        self.koff_norm = nn.LayerNorm(hidden_dim)
         self.koff_mlp = MLP(
             hidden_dim, hidden_dim, 1,
             num_layers=3, dropout=dropout,
@@ -78,7 +79,10 @@ class SurvivalHead(nn.Module):
         complex_features = scatter_mean(
             h_final, node_to_complex, dim=0, dim_size=num_complexes
         )  # [B, D]
-        output["log_koff"] = self.koff_mlp(complex_features).squeeze(-1)  # [B]
+        # Normalize and clamp to prevent gradient explosion
+        complex_features = self.koff_norm(complex_features)
+        raw_koff = self.koff_mlp(complex_features).squeeze(-1)  # [B]
+        output["log_koff"] = raw_koff.clamp(-10.0, 10.0)  # [B]
 
         if self.use_survival and len(risk_scores_sequence) > 0:
             hazard_rates = []
